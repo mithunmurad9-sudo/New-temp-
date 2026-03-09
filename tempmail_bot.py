@@ -1,18 +1,23 @@
 """
-Telegram Temp Mail Bot - Guerrilla Mail API
-==========================================
+Telegram Temp Mail Bot
+======================
+Uses mail.tm API (reliable, no blocks on cloud servers)
 Production-grade async bot for 10k+ concurrent users
 
 Setup:
 1. pip install python-telegram-bot aiohttp
-2. BOT_TOKEN = get from @BotFather
-3. ADMIN_ID  = your Telegram user ID
-4. python tempmail_bot.py
+2. Set environment variables:
+   - BOT_TOKEN = your token from @BotFather
+   - ADMIN_ID  = your Telegram user ID
+3. python tempmail_bot.py
 """
 
 import logging
 import re
 import asyncio
+import os
+import random
+import string
 from collections import defaultdict
 
 import aiohttp
@@ -26,9 +31,9 @@ from telegram.ext import (
 )
 
 # ===================== CONFIG =====================
-BOT_TOKEN     = "8577440207:AAFjbJLScFEx1tPOs6WlHIFnLnPDyNWkW6o"
-ADMIN_ID      = 7540185501
-GUERRILLA_API = "https://api.guerrillamail.com/ajax.php"
+BOT_TOKEN     = os.environ.get("BOT_TOKEN", "8577440207:AAFjbJLScFEx1tPOs6WlHIFnLnPDyNWkW6o")
+ADMIN_ID      = int(os.environ.get("7540185501", "0"))
+MAIL_TM_API   = "https://api.mail.tm"
 MAX_RETRIES   = 3
 POOL_SIZE     = 100
 AUTO_INTERVAL = 10
@@ -55,54 +60,114 @@ async def get_http_session() -> aiohttp.ClientSession:
     if http_session is None or http_session.closed:
         connector = aiohttp.TCPConnector(
             limit=POOL_SIZE,
-            limit_per_host=POOL_SIZE,
+            limit_per_host=50,
             ttl_dns_cache=300,
             enable_cleanup_closed=True
         )
-        timeout = aiohttp.ClientTimeout(total=10, connect=3)
-        http_session = aiohttp.ClientSession(connector=connector, timeout=timeout)
+        timeout = aiohttp.ClientTimeout(total=15, connect=5)
+        http_session = aiohttp.ClientSession(
+            connector=connector,
+            timeout=timeout,
+            headers={"Content-Type": "application/json"}
+        )
     return http_session
 
 
-async def api_get(params: dict, retries: int = MAX_RETRIES) -> dict | None:
+async def api_request(method: str, endpoint: str, json_data: dict = None,
+                      token: str = None, retries: int = MAX_RETRIES) -> dict | None:
     session = await get_http_session()
+    url     = f"{MAIL_TM_API}{endpoint}"
+    headers = {}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
     for attempt in range(retries):
         try:
-            async with session.get(GUERRILLA_API, params=params) as resp:
-                if resp.status == 200:
-                    return await resp.json(content_type=None)
-                logger.warning(f"API status {resp.status}, attempt {attempt+1}")
+            if method == "GET":
+                async with session.get(url, headers=headers) as resp:
+                    if resp.status in (200, 201):
+                        return await resp.json()
+                    logger.warning(f"GET {endpoint} → {resp.status} (attempt {attempt+1})")
+            elif method == "POST":
+                async with session.post(url, json=json_data, headers=headers) as resp:
+                    if resp.status in (200, 201):
+                        return await resp.json()
+                    logger.warning(f"POST {endpoint} → {resp.status} (attempt {attempt+1})")
+            elif method == "DELETE":
+                async with session.delete(url, headers=headers) as resp:
+                    return {"ok": resp.status in (200, 204)}
         except asyncio.TimeoutError:
-            logger.warning(f"Timeout on attempt {attempt+1}")
+            logger.warning(f"Timeout on attempt {attempt+1} for {endpoint}")
         except aiohttp.ClientError as e:
             logger.warning(f"Client error on attempt {attempt+1}: {e}")
         if attempt < retries - 1:
-            await asyncio.sleep(0.3 * (attempt + 1))
+            await asyncio.sleep(0.5 * (attempt + 1))
     return None
 
 
 # ============================================================
-# Guerrilla Mail API
+# mail.tm API functions
 # ============================================================
 
-async def async_get_email() -> dict | None:
-    data = await api_get({"f": "get_email_address", "lang": "en"})
-    if data:
-        return {"email": data.get("email_addr", ""), "sid_token": data.get("sid_token", "")}
+def random_string(length=10) -> str:
+    return ''.join(random.choices(string.ascii_lowercase + string.digits, k=length))
+
+
+async def get_domains() -> str | None:
+    """Get an available domain from mail.tm"""
+    data = await api_request("GET", "/domains")
+    if data and "hydra:member" in data and data["hydra:member"]:
+        return data["hydra:member"][0]["domain"]
     return None
 
 
-async def async_check_email(sid_token: str, seq: int = 0) -> list:
-    data = await api_get({"f": "check_email", "sid_token": sid_token, "seq": seq})
-    return data.get("list", []) if data else []
+async def create_account() -> dict | None:
+    """Create a new mail.tm account and return email + token"""
+    domain = await get_domains()
+    if not domain:
+        logger.error("Could not fetch domains from mail.tm")
+        return None
+
+    username = random_string(10)
+    password = random_string(12)
+    email    = f"{username}@{domain}"
+
+    # Register account
+    reg = await api_request("POST", "/accounts", {"address": email, "password": password})
+    if not reg:
+        logger.error("Could not register mail.tm account")
+        return None
+
+    # Get JWT token
+    auth = await api_request("POST", "/token", {"address": email, "password": password})
+    if not auth or "token" not in auth:
+        logger.error("Could not authenticate with mail.tm")
+        return None
+
+    return {
+        "email":      email,
+        "password":   password,
+        "account_id": reg.get("id", ""),
+        "token":      auth["token"]
+    }
 
 
-async def async_fetch_email(mail_id: str, sid_token: str) -> dict | None:
-    return await api_get({"f": "fetch_email", "email_id": mail_id, "sid_token": sid_token})
+async def get_messages(token: str) -> list:
+    """Fetch inbox messages"""
+    data = await api_request("GET", "/messages", token=token)
+    if data and "hydra:member" in data:
+        return data["hydra:member"]
+    return []
 
 
-async def async_forget_me(sid_token: str, email_addr: str) -> None:
-    await api_get({"f": "forget_me", "sid_token": sid_token, "email_addr": email_addr})
+async def get_message(token: str, msg_id: str) -> dict | None:
+    """Fetch a single message content"""
+    return await api_request("GET", f"/messages/{msg_id}", token=token)
+
+
+async def delete_account(token: str, account_id: str) -> None:
+    """Delete the mail.tm account"""
+    await api_request("DELETE", f"/accounts/{account_id}", token=token)
 
 
 # ============================================================
@@ -110,19 +175,19 @@ async def async_forget_me(sid_token: str, email_addr: str) -> None:
 # ============================================================
 
 async def create_session(user_id: int) -> dict | None:
-    """Delete old email first (if exists), then create new one instantly"""
     async with user_locks[user_id]:
-        # Delete old session silently before creating new
+        # Delete old account in background
         old = user_sessions.get(user_id)
         if old:
-            asyncio.create_task(async_forget_me(old["sid_token"], old["email"]))
+            asyncio.create_task(delete_account(old["token"], old["account_id"]))
 
-        data = await async_get_email()
+        data = await create_account()
         if data:
             user_sessions[user_id] = {
-                "sid_token":  data["sid_token"],
                 "email":      data["email"],
-                "seq":        0,
+                "token":      data["token"],
+                "account_id": data["account_id"],
+                "seen_ids":   set(),
                 "auto_check": False
             }
         return data
@@ -145,12 +210,12 @@ REPLY_KB = ReplyKeyboardMarkup(
 def main_inline_kb():
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("📬 Inbox",        callback_data="check_inbox"),
-            InlineKeyboardButton("📋 Copy Email",   callback_data="copy_email"),
+            InlineKeyboardButton("📬 Inbox",      callback_data="check_inbox"),
+            InlineKeyboardButton("📋 Copy Email", callback_data="copy_email"),
         ],
         [
-            InlineKeyboardButton("🆕 New Email",    callback_data="new_email"),
-            InlineKeyboardButton("⚡ Auto-Check",   callback_data="auto_check"),
+            InlineKeyboardButton("🆕 New Email",  callback_data="new_email"),
+            InlineKeyboardButton("⚡ Auto-Check", callback_data="auto_check"),
         ]
     ])
 
@@ -164,9 +229,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     first_name = update.effective_user.first_name
     all_users.add(user_id)
 
+    await update.message.reply_text("⏳ Creating your email address...")
     data = await create_session(user_id)
     if not data:
-        await update.message.reply_text("❌ API error! Please try again later.")
+        await update.message.reply_text(
+            "❌ API error! Could not create email. Please try /start again."
+        )
         return
 
     await update.message.reply_text(
@@ -188,10 +256,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def reply_kb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     all_users.add(user_id)
-    text = update.message.text.strip()
+    text    = update.message.text.strip()
 
     if text == "📧 New Email":
-        # Delete old + create new in under 1 second
+        await update.message.reply_text("⏳ Creating new email...")
         data = await create_session(user_id)
         if data:
             msg = (
@@ -207,14 +275,11 @@ async def reply_kb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text == "🔄 Refresh Inbox":
         session = get_session(user_id)
         if not session:
-            await create_session(user_id)
-            session = get_session(user_id)
-        if not session:
             await update.message.reply_text("❌ Please type /start first.")
             return
 
-        emails = await async_check_email(session["sid_token"], session["seq"])
-        if not emails:
+        msgs = await get_messages(session["token"])
+        if not msgs:
             await update.message.reply_text(
                 f"📭 Inbox is empty!\n\n📧 `{session['email']}`\n\nNo emails yet.",
                 parse_mode="Markdown",
@@ -222,14 +287,16 @@ async def reply_kb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        text_out = f"📬 *{len(emails)} email(s) found*\n\n📧 `{session['email']}`\n\n"
+        text_out = f"📬 *{len(msgs)} email(s) found*\n\n📧 `{session['email']}`\n\n"
         buttons  = []
-        for mail in emails[:10]:
-            subject = mail.get("mail_subject", "No Subject")[:40]
-            sender  = mail.get("mail_from", "Unknown")[:30]
-            mail_id = mail.get("mail_id", "")
+        for msg in msgs[:10]:
+            subject = msg.get("subject", "No Subject")[:40]
+            sender  = msg.get("from", {}).get("address", "Unknown")[:30]
+            msg_id  = msg.get("id", "")
             text_out += f"📩 *{subject}*\n   👤 {sender}\n\n"
-            buttons.append([InlineKeyboardButton(f"📖 Read: {subject[:28]}", callback_data=f"read_{mail_id}")])
+            buttons.append([InlineKeyboardButton(
+                f"📖 Read: {subject[:28]}", callback_data=f"read_{msg_id}"
+            )])
         buttons.append([InlineKeyboardButton("🔄 Refresh", callback_data="check_inbox")])
 
         await update.message.reply_text(text_out, parse_mode="Markdown", reply_markup=REPLY_KB)
@@ -248,30 +315,29 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     session = get_session(user_id)
     if not session:
-        data = await create_session(user_id)
-        if not data:
-            await query.edit_message_text("❌ Please type /start to begin.")
-            return
-        session = get_session(user_id)
+        await query.edit_message_text("❌ Please type /start to begin.")
+        return
 
     # ── Inbox ──
     if cb_data == "check_inbox":
-        emails = await async_check_email(session["sid_token"], session["seq"])
-        if not emails:
+        msgs = await get_messages(session["token"])
+        if not msgs:
             await query.edit_message_text(
                 f"📭 Inbox is empty!\n\n📧 `{session['email']}`",
                 parse_mode="Markdown",
                 reply_markup=main_inline_kb()
             )
         else:
-            text    = f"📬 *{len(emails)} email(s)*\n\n📧 `{session['email']}`\n\n"
+            text    = f"📬 *{len(msgs)} email(s)*\n\n📧 `{session['email']}`\n\n"
             buttons = []
-            for mail in emails[:10]:
-                subject = mail.get("mail_subject", "No Subject")[:40]
-                sender  = mail.get("mail_from", "Unknown")[:30]
-                mail_id = mail.get("mail_id", "")
+            for msg in msgs[:10]:
+                subject = msg.get("subject", "No Subject")[:40]
+                sender  = msg.get("from", {}).get("address", "Unknown")[:30]
+                msg_id  = msg.get("id", "")
                 text += f"📩 *{subject}*\n   👤 {sender}\n\n"
-                buttons.append([InlineKeyboardButton(f"📖 Read: {subject[:28]}", callback_data=f"read_{mail_id}")])
+                buttons.append([InlineKeyboardButton(
+                    f"📖 Read: {subject[:28]}", callback_data=f"read_{msg_id}"
+                )])
             buttons.append([
                 InlineKeyboardButton("🔙 Back",    callback_data="back_main"),
                 InlineKeyboardButton("🔄 Refresh", callback_data="check_inbox")
@@ -283,12 +349,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── Read email ──
     elif cb_data.startswith("read_"):
-        mail_id   = cb_data.replace("read_", "")
-        mail_data = await async_fetch_email(mail_id, session["sid_token"])
-        if mail_data:
-            subject    = mail_data.get("mail_subject", "No Subject")
-            sender     = mail_data.get("mail_from", "Unknown")
-            body       = mail_data.get("mail_body", "")
+        msg_id   = cb_data.replace("read_", "")
+        msg_data = await get_message(session["token"], msg_id)
+        if msg_data:
+            subject    = msg_data.get("subject", "No Subject")
+            sender     = msg_data.get("from", {}).get("address", "Unknown")
+            body       = msg_data.get("text", "") or msg_data.get("html", [""])[0] if isinstance(msg_data.get("html"), list) else msg_data.get("html", "")
             body_clean = re.sub(r'<[^>]+>', '', body).strip()
             body_clean = body_clean[:1500] + ("..." if len(body_clean) > 1500 else "")
             await query.edit_message_text(
@@ -305,8 +371,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif cb_data == "copy_email":
         await query.answer(f"✅ Copied: {session['email']}", show_alert=True)
 
-    # ── New email (delete old + create new instantly) ──
+    # ── New email ──
     elif cb_data == "new_email":
+        await query.edit_message_text("⏳ Creating new email...")
         data = await create_session(user_id)
         if data:
             await query.edit_message_text(
@@ -317,7 +384,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=main_inline_kb()
             )
         else:
-            await query.answer("❌ Failed. Please try again.", show_alert=True)
+            await query.edit_message_text(
+                "❌ Failed to create email. Please try again.",
+                reply_markup=main_inline_kb()
+            )
 
     # ── Auto-Check toggle ──
     elif cb_data == "auto_check":
@@ -359,25 +429,27 @@ async def auto_check_job(context: ContextTypes.DEFAULT_TYPE):
         context.job.schedule_removal()
         return
 
-    emails = await async_check_email(session["sid_token"], session["seq"])
-    if emails:
-        async with user_locks[user_id]:
-            session["seq"] += len(emails)
+    msgs = await get_messages(session["token"])
+    new_msgs = [m for m in msgs if m.get("id") not in session["seen_ids"]]
+
+    if new_msgs:
+        for m in new_msgs:
+            session["seen_ids"].add(m.get("id"))
 
         tasks = [
             context.bot.send_message(
                 chat_id=chat_id,
                 text=(
                     f"🔔 *New email received!*\n\n"
-                    f"📩 *{mail.get('mail_subject', 'No Subject')}*\n"
-                    f"👤 From: `{mail.get('mail_from', 'Unknown')}`"
+                    f"📩 *{m.get('subject', 'No Subject')}*\n"
+                    f"👤 From: `{m.get('from', {}).get('address', 'Unknown')}`"
                 ),
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("📖 Read", callback_data=f"read_{mail.get('mail_id', '')}")
+                    InlineKeyboardButton("📖 Read", callback_data=f"read_{m.get('id', '')}")
                 ]])
             )
-            for mail in emails
+            for m in new_msgs
         ]
         await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -419,12 +491,11 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     results = await asyncio.gather(*[send_one(uid) for uid in user_list])
     success  = sum(results)
-    failed   = len(results) - success
 
     await status_msg.edit_text(
         f"✅ Broadcast complete!\n\n"
         f"✔️ Sent: {success}\n"
-        f"❌ Failed: {failed}\n"
+        f"❌ Failed: {len(results) - success}\n"
         f"👥 Total: {len(user_list)}"
     )
 
@@ -460,7 +531,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "*Admin Commands:*\n"
         "`/broadcast [message]` — Send to all users\n"
         "`/users` — Show total user count\n\n"
-        "⚡ Async engine — Supports 10k+ users 🚀",
+        "⚡ Powered by mail.tm + async engine 🚀",
         parse_mode="Markdown",
         reply_markup=REPLY_KB
     )
