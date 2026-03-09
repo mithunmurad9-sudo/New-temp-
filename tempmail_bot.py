@@ -1,14 +1,14 @@
 """
-Telegram Temp Mail Bot
-======================
-Uses mail.tm API (reliable, no blocks on cloud servers)
-Production-grade async bot for 10k+ concurrent users
+Telegram Temp Mail Bot - mail.tm API
+=====================================
+- No inline buttons (clean UI)
+- Tap email to copy instantly
+- Always-on auto scan (no toggle needed)
+- New email = old deleted instantly
 
 Setup:
 1. pip install python-telegram-bot aiohttp
-2. Set environment variables:
-   - BOT_TOKEN = your token from @BotFather
-   - ADMIN_ID  = your Telegram user ID
+2. Set env vars: BOT_TOKEN, ADMIN_ID
 3. python tempmail_bot.py
 """
 
@@ -22,11 +22,10 @@ from collections import defaultdict
 
 import aiohttp
 from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup,
-    ReplyKeyboardMarkup, KeyboardButton
+    Update, ReplyKeyboardMarkup, KeyboardButton
 )
 from telegram.ext import (
-    ApplicationBuilder, CommandHandler, CallbackQueryHandler,
+    ApplicationBuilder, CommandHandler,
     MessageHandler, filters, ContextTypes
 )
 
@@ -36,7 +35,7 @@ ADMIN_ID      = int(os.environ.get("7540185501", "0"))
 MAIL_TM_API   = "https://api.mail.tm"
 MAX_RETRIES   = 3
 POOL_SIZE     = 100
-AUTO_INTERVAL = 10
+AUTO_INTERVAL = 10   # check every 10 seconds
 # ==================================================
 
 logging.basicConfig(
@@ -87,26 +86,24 @@ async def api_request(method: str, endpoint: str, json_data: dict = None,
                 async with session.get(url, headers=headers) as resp:
                     if resp.status in (200, 201):
                         return await resp.json()
-                    logger.warning(f"GET {endpoint} → {resp.status} (attempt {attempt+1})")
             elif method == "POST":
                 async with session.post(url, json=json_data, headers=headers) as resp:
                     if resp.status in (200, 201):
                         return await resp.json()
-                    logger.warning(f"POST {endpoint} → {resp.status} (attempt {attempt+1})")
             elif method == "DELETE":
                 async with session.delete(url, headers=headers) as resp:
                     return {"ok": resp.status in (200, 204)}
         except asyncio.TimeoutError:
-            logger.warning(f"Timeout on attempt {attempt+1} for {endpoint}")
+            logger.warning(f"Timeout attempt {attempt+1} for {endpoint}")
         except aiohttp.ClientError as e:
-            logger.warning(f"Client error on attempt {attempt+1}: {e}")
+            logger.warning(f"Client error attempt {attempt+1}: {e}")
         if attempt < retries - 1:
             await asyncio.sleep(0.5 * (attempt + 1))
     return None
 
 
 # ============================================================
-# mail.tm API functions
+# mail.tm API
 # ============================================================
 
 def random_string(length=10) -> str:
@@ -114,7 +111,6 @@ def random_string(length=10) -> str:
 
 
 async def get_domains() -> str | None:
-    """Get an available domain from mail.tm"""
     data = await api_request("GET", "/domains")
     if data and "hydra:member" in data and data["hydra:member"]:
         return data["hydra:member"][0]["domain"]
@@ -122,26 +118,20 @@ async def get_domains() -> str | None:
 
 
 async def create_account() -> dict | None:
-    """Create a new mail.tm account and return email + token"""
     domain = await get_domains()
     if not domain:
-        logger.error("Could not fetch domains from mail.tm")
         return None
 
     username = random_string(10)
     password = random_string(12)
     email    = f"{username}@{domain}"
 
-    # Register account
     reg = await api_request("POST", "/accounts", {"address": email, "password": password})
     if not reg:
-        logger.error("Could not register mail.tm account")
         return None
 
-    # Get JWT token
     auth = await api_request("POST", "/token", {"address": email, "password": password})
     if not auth or "token" not in auth:
-        logger.error("Could not authenticate with mail.tm")
         return None
 
     return {
@@ -153,7 +143,6 @@ async def create_account() -> dict | None:
 
 
 async def get_messages(token: str) -> list:
-    """Fetch inbox messages"""
     data = await api_request("GET", "/messages", token=token)
     if data and "hydra:member" in data:
         return data["hydra:member"]
@@ -161,12 +150,10 @@ async def get_messages(token: str) -> list:
 
 
 async def get_message(token: str, msg_id: str) -> dict | None:
-    """Fetch a single message content"""
     return await api_request("GET", f"/messages/{msg_id}", token=token)
 
 
 async def delete_account(token: str, account_id: str) -> None:
-    """Delete the mail.tm account"""
     await api_request("DELETE", f"/accounts/{account_id}", token=token)
 
 
@@ -176,7 +163,6 @@ async def delete_account(token: str, account_id: str) -> None:
 
 async def create_session(user_id: int) -> dict | None:
     async with user_locks[user_id]:
-        # Delete old account in background
         old = user_sessions.get(user_id)
         if old:
             asyncio.create_task(delete_account(old["token"], old["account_id"]))
@@ -188,7 +174,7 @@ async def create_session(user_id: int) -> dict | None:
                 "token":      data["token"],
                 "account_id": data["account_id"],
                 "seen_ids":   set(),
-                "auto_check": False
+                "chat_id":    None
             }
         return data
 
@@ -198,7 +184,7 @@ def get_session(user_id: int) -> dict | None:
 
 
 # ============================================================
-# Keyboards
+# Keyboard (only 2 bottom buttons, no inline)
 # ============================================================
 
 REPLY_KB = ReplyKeyboardMarkup(
@@ -206,18 +192,6 @@ REPLY_KB = ReplyKeyboardMarkup(
     resize_keyboard=True,
     is_persistent=True
 )
-
-def main_inline_kb():
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("📬 Inbox",      callback_data="check_inbox"),
-            InlineKeyboardButton("📋 Copy Email", callback_data="copy_email"),
-        ],
-        [
-            InlineKeyboardButton("🆕 New Email",  callback_data="new_email"),
-            InlineKeyboardButton("⚡ Auto-Check", callback_data="auto_check"),
-        ]
-    ])
 
 
 # ============================================================
@@ -232,21 +206,24 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⏳ Creating your email address...")
     data = await create_session(user_id)
     if not data:
-        await update.message.reply_text(
-            "❌ API error! Could not create email. Please try /start again."
-        )
+        await update.message.reply_text("❌ API error! Please try /start again.")
         return
+
+    # Save chat_id for auto-scan notifications
+    user_sessions[user_id]["chat_id"] = update.effective_chat.id
+
+    # Start always-on auto scan
+    _start_auto_scan(user_id, update.effective_chat.id, context)
 
     await update.message.reply_text(
         f"👋 Welcome, {first_name}!\n\n"
         f"⚡ *Temp Mail Bot*\n\n"
-        f"📧 Your new email address:\n`{data['email']}`\n\n"
+        f"📧 Your email address:\n`{data['email']}`\n\n"
         f"_(Tap the email above to copy it)_\n\n"
-        f"Use the buttons below 👇",
+        f"🔔 Auto-scan is *always ON* — you'll be notified instantly when an email arrives!",
         parse_mode="Markdown",
         reply_markup=REPLY_KB
     )
-    await update.message.reply_text("Menu:", reply_markup=main_inline_kb())
 
 
 # ============================================================
@@ -262,15 +239,22 @@ async def reply_kb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⏳ Creating new email...")
         data = await create_session(user_id)
         if data:
-            msg = (
+            user_sessions[user_id]["chat_id"] = update.effective_chat.id
+            # Restart auto-scan for new email
+            _start_auto_scan(user_id, update.effective_chat.id, context)
+            await update.message.reply_text(
                 f"✅ New email created!\n\n"
                 f"📧 `{data['email']}`\n\n"
-                f"Old email has been deleted. Use this address anywhere."
+                f"Old email deleted.\n"
+                f"🔔 Auto-scan restarted for new address!",
+                parse_mode="Markdown",
+                reply_markup=REPLY_KB
             )
         else:
-            msg = "❌ Failed to create email. Please try again."
-        await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=REPLY_KB)
-        await update.message.reply_text("Menu:", reply_markup=main_inline_kb())
+            await update.message.reply_text(
+                "❌ Failed to create email. Please try again.",
+                reply_markup=REPLY_KB
+            )
 
     elif text == "🔄 Refresh Inbox":
         session = get_session(user_id)
@@ -281,177 +265,101 @@ async def reply_kb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msgs = await get_messages(session["token"])
         if not msgs:
             await update.message.reply_text(
-                f"📭 Inbox is empty!\n\n📧 `{session['email']}`\n\nNo emails yet.",
+                f"📭 *Inbox is empty*\n\n"
+                f"📧 `{session['email']}`\n\n"
+                f"No emails yet. Auto-scan is running 🔔",
                 parse_mode="Markdown",
                 reply_markup=REPLY_KB
             )
             return
 
-        text_out = f"📬 *{len(msgs)} email(s) found*\n\n📧 `{session['email']}`\n\n"
-        buttons  = []
+        text_out = f"📬 *{len(msgs)} email(s) in inbox*\n\n📧 `{session['email']}`\n\n"
         for msg in msgs[:10]:
-            subject = msg.get("subject", "No Subject")[:40]
-            sender  = msg.get("from", {}).get("address", "Unknown")[:30]
-            msg_id  = msg.get("id", "")
-            text_out += f"📩 *{subject}*\n   👤 {sender}\n\n"
-            buttons.append([InlineKeyboardButton(
-                f"📖 Read: {subject[:28]}", callback_data=f"read_{msg_id}"
-            )])
-        buttons.append([InlineKeyboardButton("🔄 Refresh", callback_data="check_inbox")])
+            subject = msg.get("subject", "No Subject")[:50]
+            sender  = msg.get("from", {}).get("address", "Unknown")[:40]
+            intro   = msg.get("intro", "")[:80]
+            text_out += f"📩 *{subject}*\n👤 {sender}\n_{intro}_\n\n"
 
-        await update.message.reply_text(text_out, parse_mode="Markdown", reply_markup=REPLY_KB)
-        await update.message.reply_text("Inbox:", reply_markup=InlineKeyboardMarkup(buttons))
-
-
-# ============================================================
-# Inline button handler
-# ============================================================
-
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query   = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-    cb_data = query.data
-
-    session = get_session(user_id)
-    if not session:
-        await query.edit_message_text("❌ Please type /start to begin.")
-        return
-
-    # ── Inbox ──
-    if cb_data == "check_inbox":
-        msgs = await get_messages(session["token"])
-        if not msgs:
-            await query.edit_message_text(
-                f"📭 Inbox is empty!\n\n📧 `{session['email']}`",
-                parse_mode="Markdown",
-                reply_markup=main_inline_kb()
-            )
-        else:
-            text    = f"📬 *{len(msgs)} email(s)*\n\n📧 `{session['email']}`\n\n"
-            buttons = []
-            for msg in msgs[:10]:
-                subject = msg.get("subject", "No Subject")[:40]
-                sender  = msg.get("from", {}).get("address", "Unknown")[:30]
-                msg_id  = msg.get("id", "")
-                text += f"📩 *{subject}*\n   👤 {sender}\n\n"
-                buttons.append([InlineKeyboardButton(
-                    f"📖 Read: {subject[:28]}", callback_data=f"read_{msg_id}"
-                )])
-            buttons.append([
-                InlineKeyboardButton("🔙 Back",    callback_data="back_main"),
-                InlineKeyboardButton("🔄 Refresh", callback_data="check_inbox")
-            ])
-            await query.edit_message_text(
-                text, parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup(buttons)
-            )
-
-    # ── Read email ──
-    elif cb_data.startswith("read_"):
-        msg_id   = cb_data.replace("read_", "")
-        msg_data = await get_message(session["token"], msg_id)
-        if msg_data:
-            subject    = msg_data.get("subject", "No Subject")
-            sender     = msg_data.get("from", {}).get("address", "Unknown")
-            body       = msg_data.get("text", "") or msg_data.get("html", [""])[0] if isinstance(msg_data.get("html"), list) else msg_data.get("html", "")
-            body_clean = re.sub(r'<[^>]+>', '', body).strip()
-            body_clean = body_clean[:1500] + ("..." if len(body_clean) > 1500 else "")
-            await query.edit_message_text(
-                f"📩 *{subject}*\n👤 From: `{sender}`\n\n─────────────────\n{body_clean}",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("🔙 Back to Inbox", callback_data="check_inbox")
-                ]])
-            )
-        else:
-            await query.answer("❌ Could not load email. Try again.", show_alert=True)
-
-    # ── Copy email ──
-    elif cb_data == "copy_email":
-        await query.answer(f"✅ Copied: {session['email']}", show_alert=True)
-
-    # ── New email ──
-    elif cb_data == "new_email":
-        await query.edit_message_text("⏳ Creating new email...")
-        data = await create_session(user_id)
-        if data:
-            await query.edit_message_text(
-                f"✅ New email created!\n\n"
-                f"📧 `{data['email']}`\n\n"
-                f"Old email deleted. Ready to use!",
-                parse_mode="Markdown",
-                reply_markup=main_inline_kb()
-            )
-        else:
-            await query.edit_message_text(
-                "❌ Failed to create email. Please try again.",
-                reply_markup=main_inline_kb()
-            )
-
-    # ── Auto-Check toggle ──
-    elif cb_data == "auto_check":
-        async with user_locks[user_id]:
-            session["auto_check"] = not session.get("auto_check", False)
-        status = "✅ ON" if session["auto_check"] else "❌ OFF"
-        await query.answer(f"Auto-Check {status}", show_alert=True)
-        if session["auto_check"]:
-            for job in context.job_queue.get_jobs_by_name(f"auto_{user_id}"):
-                job.schedule_removal()
-            context.job_queue.run_repeating(
-                auto_check_job,
-                interval=AUTO_INTERVAL,
-                first=5,
-                data={"user_id": user_id, "chat_id": query.message.chat_id},
-                name=f"auto_{user_id}"
-            )
-
-    # ── Back ──
-    elif cb_data == "back_main":
-        await query.edit_message_text(
-            f"📧 Your email:\n`{session['email']}`\n\nMenu 👇",
+        await update.message.reply_text(
+            text_out,
             parse_mode="Markdown",
-            reply_markup=main_inline_kb()
+            reply_markup=REPLY_KB
         )
 
 
 # ============================================================
-# Auto-check job
+# Always-on auto scan
 # ============================================================
 
-async def auto_check_job(context: ContextTypes.DEFAULT_TYPE):
+def _start_auto_scan(user_id: int, chat_id: int, context):
+    """Remove old job and start fresh auto-scan for this user"""
+    for job in context.job_queue.get_jobs_by_name(f"scan_{user_id}"):
+        job.schedule_removal()
+    context.job_queue.run_repeating(
+        auto_scan_job,
+        interval=AUTO_INTERVAL,
+        first=5,
+        data={"user_id": user_id, "chat_id": chat_id},
+        name=f"scan_{user_id}"
+    )
+
+
+async def auto_scan_job(context: ContextTypes.DEFAULT_TYPE):
     job_data = context.job.data
     user_id  = job_data["user_id"]
     chat_id  = job_data["chat_id"]
 
     session = get_session(user_id)
-    if not session or not session.get("auto_check", False):
+    if not session:
         context.job.schedule_removal()
         return
 
-    msgs = await get_messages(session["token"])
-    new_msgs = [m for m in msgs if m.get("id") not in session["seen_ids"]]
+    try:
+        msgs     = await get_messages(session["token"])
+        new_msgs = [m for m in msgs if m.get("id") not in session["seen_ids"]]
 
-    if new_msgs:
-        for m in new_msgs:
-            session["seen_ids"].add(m.get("id"))
+        if new_msgs:
+            for m in new_msgs:
+                session["seen_ids"].add(m.get("id"))
 
-        tasks = [
-            context.bot.send_message(
-                chat_id=chat_id,
-                text=(
-                    f"🔔 *New email received!*\n\n"
-                    f"📩 *{m.get('subject', 'No Subject')}*\n"
-                    f"👤 From: `{m.get('from', {}).get('address', 'Unknown')}`"
-                ),
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("📖 Read", callback_data=f"read_{m.get('id', '')}")
-                ]])
-            )
-            for m in new_msgs
-        ]
-        await asyncio.gather(*tasks, return_exceptions=True)
+            # Fetch full content for each new email
+            tasks = []
+            for m in new_msgs:
+                tasks.append(_send_email_notification(context, chat_id, session["token"], m))
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    except Exception as e:
+        logger.warning(f"Auto-scan error for user {user_id}: {e}")
+
+
+async def _send_email_notification(context, chat_id: int, token: str, mail_summary: dict):
+    """Fetch full email and send to user"""
+    msg_id   = mail_summary.get("id", "")
+    subject  = mail_summary.get("subject", "No Subject")
+    sender   = mail_summary.get("from", {}).get("address", "Unknown")
+
+    # Fetch full body
+    full = await get_message(token, msg_id)
+    if full:
+        body = full.get("text", "") or ""
+        if not body and full.get("html"):
+            html = full["html"]
+            body = re.sub(r'<[^>]+>', '', html[0] if isinstance(html, list) else html).strip()
+        body = body[:2000] + ("..." if len(body) > 2000 else "")
+    else:
+        body = "(Could not load email body)"
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            f"🔔 *New Email Received!*\n\n"
+            f"📩 *Subject:* {subject}\n"
+            f"👤 *From:* `{sender}`\n\n"
+            f"─────────────────\n"
+            f"{body}"
+        ),
+        parse_mode="Markdown"
+    )
 
 
 # ============================================================
@@ -472,7 +380,7 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg_text   = " ".join(context.args)
     user_list  = list(all_users)
     status_msg = await update.message.reply_text(
-        f"📤 Sending broadcast to {len(user_list)} users..."
+        f"📤 Sending to {len(user_list)} users..."
     )
 
     sem = asyncio.Semaphore(30)
@@ -520,17 +428,14 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🤖 *Temp Mail Bot — Help*\n\n"
         "*/start* — Create a new temp email\n"
         "*/help* — Show this help\n\n"
-        "*Bottom buttons (always visible):*\n"
+        "*Buttons:*\n"
         "📧 New Email — Delete old & get new instantly\n"
-        "🔄 Refresh Inbox — Check for new emails\n\n"
-        "*Inline buttons:*\n"
-        "📬 Inbox — View all emails\n"
-        "📋 Copy Email — Copy your address\n"
-        "🆕 New Email — Delete old & create new\n"
-        "⚡ Auto-Check — Get notified every 10 sec\n\n"
-        "*Admin Commands:*\n"
-        "`/broadcast [message]` — Send to all users\n"
-        "`/users` — Show total user count\n\n"
+        "🔄 Refresh Inbox — View current emails\n\n"
+        "🔔 *Auto-scan is always ON* — no setup needed!\n"
+        "You'll get notified the moment an email arrives.\n\n"
+        "*Admin:*\n"
+        "`/broadcast [msg]` — Message all users\n"
+        "`/users` — Total user count\n\n"
         "⚡ Powered by mail.tm + async engine 🚀",
         parse_mode="Markdown",
         reply_markup=REPLY_KB
@@ -571,7 +476,6 @@ def main():
     app.add_handler(CommandHandler("help",      help_command))
     app.add_handler(CommandHandler("broadcast", broadcast))
     app.add_handler(CommandHandler("users",     users_count))
-    app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(
         filters.TEXT & filters.Regex("^(📧 New Email|🔄 Refresh Inbox)$"),
         reply_kb_handler
