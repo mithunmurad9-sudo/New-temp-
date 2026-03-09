@@ -23,7 +23,7 @@ from telegram.ext import (
 )
 
 # ===================== CONFIG =====================
-BOT_TOKEN     = os.environ.get("BOT_TOKEN", "8577440207:AAFjbJLScFEx1tPOs6WlHIFnLnPDyNWkW6o)
+BOT_TOKEN     = os.environ.get("BOT_TOKEN", "8577440207:AAFjbJLScFEx1tPOs6WlHIFnLnPDyNWkW6o")
 ADMIN_ID      = int(os.environ.get("7540185501", "0"))
 MAIL_TM_API   = "https://api.mail.tm"
 MAX_RETRIES   = 5          # increased retries
